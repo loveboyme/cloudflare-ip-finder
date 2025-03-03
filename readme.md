@@ -1,3 +1,7 @@
+📜 **[查看更新日志](changelog.md)**
+
+---
+
 # 🚀 Cloudflare IP 优选工具
 
 一个图形化的跨平台工具，帮助你找到最适合你的网络环境的 Cloudflare IP，提升访问速度，告别卡顿！
@@ -47,6 +51,9 @@
 ## 📜 许可证
 
 本项目使用 [MIT License](https://www.google.com/url?sa=E&q=LICENSE) 开源许可证。
+
+
+
 
 ## 🙏 感谢
 

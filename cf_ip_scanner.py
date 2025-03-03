@@ -15,42 +15,44 @@ import dns.resolver
 from packaging import version
 import winreg
 import urllib3
-urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
+import random
 
+urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
 CONFIG_PATH = Path.home() / '.cf_ip_scanner_config.json'
 HISTORY_PATH = Path.home() / '.cf_ip_scanner_history.json'
 
 class ConfigManager:
     DEFAULT_CONFIG = {
-        'ip_type': 'IPv4', # 默认 IP 类型设置为 IPv4
+        'ip_type': 'IPv4',
         'test_count': 500,
         'max_threads': 100,
         'timeout': 3,
         'history_limit': 30,
-        #'auto_update': True, # 移除 auto_update
         'proxy_settings': {
             'enable': False,
             'port': 1080,
             'protocol': 'socks5'
         },
-        'cloudflare_domains': [  # 默认 Cloudflare 域名列表
+        'cloudflare_domains': [
             'speed.cloudflare.com',
             'cloudflare.com',
             'www.cloudflare.com',
             'developers.cloudflare.com',
             'community.cloudflare.com'
-            # 可根据需要添加更多域名
-        ]
+        ],
+        'test_retries': 3,
+        'ip_persistent': True,
+        'ip_file_path': str(Path.home() / '.cf_ip_list.txt'),
     }
 
     @classmethod
     def load_config(cls):
+        """加载配置"""
         try:
             if CONFIG_PATH.exists():
                 with open(CONFIG_PATH, 'r', encoding='utf-8') as f:
                     config = json.load(f)
-                    # 合并配置，保持向后兼容性，并使用默认域名列表
                     default_domains = cls.DEFAULT_CONFIG.get('cloudflare_domains', [])
                     config_domains = config.get('cloudflare_domains', [])
                     config['cloudflare_domains'] = config_domains if config_domains else default_domains
@@ -64,40 +66,17 @@ class ConfigManager:
 
     @classmethod
     def save_config(cls, config):
+        """保存配置"""
         try:
-            # 移除 auto_update 保存
-            #config_to_save = {k: v for k, v in config.items() if k != 'auto_update'}
             with open(CONFIG_PATH, 'w', encoding='utf-8') as f:
                 json.dump(config, f, indent=2, ensure_ascii=False)
         except Exception as e:
             print(f"Error saving config: {e}")
 
-# 移除 AutoUpdater 类
-# class AutoUpdater:
-#     GITHUB_API = "https://api.github.com/repos/username/cf-ip-scanner/releases/latest" # 请替换为你的仓库
-
-#     @classmethod
-#     def check_update(cls, current_version):
-#         try:
-#             response = requests.get(cls.GITHUB_API, timeout=5)
-#             response.raise_for_status()  # Raise an exception for HTTP errors
-#             latest = response.json()
-#             latest_ver = version.parse(latest['tag_name'])
-#             return latest_ver > version.parse(current_version)
-#         except requests.exceptions.RequestException as e:
-#             print(f"Update check failed (network issue): {e}")
-#             return False
-#         except json.JSONDecodeError as e:
-#             print(f"Update check failed (JSON error): {e}")
-#             return False
-#         except Exception as e:
-#             print(f"Update check failed: {e}")
-#             return False
-
-
 class NetworkDiagnostics:
     @staticmethod
     def traceroute(host):
+        """路由追踪"""
         os_type = platform.system()
         command = ['tracert', '-d', host] if os_type == 'Windows' else ['traceroute', host]
 
@@ -115,6 +94,7 @@ class NetworkDiagnostics:
 
     @staticmethod
     def dns_lookup(host, dns_server=None):
+        """DNS 解析"""
         try:
             resolver = dns.resolver.Resolver()
             if dns_server:
@@ -127,6 +107,7 @@ class NetworkDiagnostics:
 
     @staticmethod
     def tcp_ping(host, port, timeout=3):
+        """TCP Ping"""
         try:
             start = time.time()
             with socket.create_connection((host, port), timeout=timeout):
@@ -136,12 +117,14 @@ class NetworkDiagnostics:
             return f"Connection failed: {e}"
 
 class HistoryManager:
+    """历史记录管理"""
     def __init__(self):
         self.config = ConfigManager.load_config()
         self.history_file = HISTORY_PATH
         self.history = self._load_history()
 
     def _load_history(self):
+        """加载历史记录"""
         try:
             if self.history_file.exists():
                 with open(self.history_file, 'r', encoding='utf-8') as f:
@@ -152,6 +135,7 @@ class HistoryManager:
             return []
 
     def save_history(self):
+        """保存历史记录"""
         try:
             with open(self.history_file, 'w', encoding='utf-8') as f:
                 json.dump(self.history[-self.config['history_limit']:], f, indent=2, ensure_ascii=False)
@@ -159,6 +143,7 @@ class HistoryManager:
             print(f"Save history failed: {e}")
 
     def add_record(self, record):
+        """添加记录"""
         self.history.append({
             'timestamp': time.time(),
             'data': record
@@ -166,14 +151,17 @@ class HistoryManager:
         self.save_history()
 
     def get_comparison_data(self, days=7):
+        """获取对比数据"""
         cutoff = time.time() - days * 86400
         return [r for r in self.history if r['timestamp'] > cutoff]
 
 class SystemProxy:
+    """系统代理配置"""
     PROXY_PATH = r"Software\Microsoft\Windows\CurrentVersion\Internet Settings"
 
     @classmethod
     def configure_proxy(cls, enable=True, server='127.0.0.1:1080', bypass=''):
+        """配置系统代理"""
         if platform.system() != 'Windows':
             print("System proxy configuration is only supported on Windows.")
             return False
@@ -187,8 +175,43 @@ class SystemProxy:
             print(f"Proxy config failed: {e}")
             return False
 
-class CloudFlareIPScanner:
+class IPManager:
+    """IP 地址管理"""
     def __init__(self):
+        self.config = ConfigManager.load_config()
+        self.cidr_history = set()
+
+    def generate_and_save_ips(self, cidrs, ip_type='IPv4'):
+        """增量生成并存储IP地址"""
+        new_ips = set()
+
+        if Path(self.config['ip_file_path']).exists():
+            with open(self.config['ip_file_path'], 'r') as f:
+                for line in f:
+                    if '/' in line:
+                        self.cidr_history.add(line.strip())
+
+        for cidr in cidrs:
+            if cidr not in self.cidr_history:
+                network = ipaddress.ip_network(cidr)
+                new_ips.update(str(host) for host in network.hosts())
+
+        if new_ips:
+            with open(self.config['ip_file_path'], 'a') as f:
+                f.write('\n'.join(new_ips) + '\n')
+            self.cidr_history.update(cidrs)
+
+    def load_ips(self):
+        """从文件加载IP列表"""
+        if Path(self.config['ip_file_path']).exists():
+            with open(self.config['ip_file_path'], 'r') as f:
+                return [line.strip() for line in f if '.' in line]
+        return []
+
+class CloudFlareIPScanner:
+    """Cloudflare IP 扫描器"""
+    def __init__(self):
+        self.ip_manager = IPManager()
         self.cf_ip_ranges = {
             'IPv4': [
                 '173.245.48.0/20',
@@ -209,16 +232,17 @@ class CloudFlareIPScanner:
             ]
         }
         self.config = ConfigManager.load_config()
+        self.load_ip_ranges()
 
     def load_ip_ranges(self):
+        """加载IP范围"""
         try:
             self._fetch_latest_ips()
         except Exception as e:
             print(f"IP update failed, using default embedded ranges: {e}")
-            # Use embedded ranges as fallback if fetching fails - now using the provided ranges directly in init
-            pass
 
     def _fetch_latest_ips(self):
+        """获取最新的IP范围"""
         ipv4_url = "https://www.cloudflare.com/ips-v4"
 
         try:
@@ -228,96 +252,119 @@ class CloudFlareIPScanner:
             print("Cloudflare IPv4 ranges updated successfully from website.")
         except requests.exceptions.RequestException as e:
             print(f"Failed to update Cloudflare IPv4 ranges from website, using embedded ranges: {e}")
-            # If fetching from website fails, fallback to the ranges defined in __init__
 
+    def generate_ips(self, ip_type='IPv4', count=500):
+        """生成IP地址（支持持久化）"""
+        if self.config['ip_persistent']:
+            if not Path(self.config['ip_file_path']).exists():
+                self.ip_manager.generate_and_save_ips(self.cf_ip_ranges['IPv4'])
+            all_ips = self.ip_manager.load_ips()
+            if not all_ips:
+                print("Warning: No IPs loaded from persistent file, falling back to CIDR range generation.")
+                return self._generate_ips_from_cidr(ip_type, count)
+            return random.sample(all_ips, min(count, len(all_ips)))
+        else:
+            return self._generate_ips_from_cidr(ip_type, count)
 
-    def generate_ips(self, ip_type='IPv4', count=500): # 默认 IP 类型为 IPv4
-        """生成随机IP地址"""
+    def _generate_ips_from_cidr(self, ip_type='IPv4', count=500):
+        """从 CIDR 生成 IP"""
         from random import choice
         ips = []
         if ip_type in self.cf_ip_ranges:
             for cidr in self.cf_ip_ranges[ip_type]:
                 network = ipaddress.ip_network(cidr)
-                for _ in range(max(1, count//len(self.cf_ip_ranges[ip_type]))): # Ensure at least one IP per range
+                for _ in range(max(1, count//len(self.cf_ip_ranges[ip_type]))):
                     ip = str(network[choice(range(1, network.num_addresses))])
                     ips.append(ip)
         return list(set(ips))[:count]
 
     def test_latency(self, ip, port=443, timeout=3, proxy_config=None):
-        """多协议延迟测试，支持代理"""
-        result = {'ip': ip, 'tcp': None, 'http': None, 'https': None}
+        """改进后的测速方法（支持重试）"""
+        result = {'ip': ip, 'tcp': [], 'http': [], 'https': []}
 
-        proxies = None
+        for _ in range(self.config['test_retries']):
+            try:
+                start = time.perf_counter()
+                with socket.create_connection((ip, port), timeout=timeout, source_address=('0.0.0.0', 0)):
+                    latency = (time.perf_counter() - start) * 1000
+                    result['tcp'].append(latency)
+                break
+            except:
+                continue
+
+        for _ in range(self.config['test_retries']):
+            try:
+                start = time.perf_counter()
+                requests.get(f'http://{ip}',
+                    headers={'Host': 'speed.cloudflare.com'},
+                    timeout=timeout,
+                    proxies=self._get_proxies(proxy_config)
+                )
+                result['http'].append((time.perf_counter() - start) * 1000)
+                break
+            except:
+                continue
+
+        for _ in range(self.config['test_retries']):
+            try:
+                start = time.perf_counter()
+                requests.get(f'https://{ip}',
+                    headers={'Host': 'speed.cloudflare.com'},
+                    timeout=timeout,
+                    verify=False,
+                    proxies=self._get_proxies(proxy_config)
+                )
+                result['https'].append((time.perf_counter() - start) * 1000)
+                break
+            except:
+                continue
+
+        result['tcp_avg'] = self._calc_avg(result['tcp'])
+        result['http_avg'] = self._calc_avg(result['http'])
+        result['https_avg'] = self._calc_avg(result['https'])
+        return result
+
+    def _calc_avg(self, values):
+        """计算平均值"""
+        return sum(values)/len(values) if values else None
+
+    def _get_proxies(self, proxy_config):
+        """代理配置方法抽取"""
         if proxy_config and proxy_config['enable']:
             protocol = proxy_config['protocol']
-            server = f"127.0.0.1:{proxy_config['port']}" # Assume local proxy
+            server = f"127.0.0.1:{proxy_config['port']}"
             if protocol == 'socks5':
-                proxies = {
-                    'http': f'socks5://{server}',
-                    'https': f'socks5://{server}'
-                }
+                return {'http': f'socks5://{server}', 'https': f'socks5://{server}'}
             elif protocol == 'http':
-                proxies = {
-                    'http': f'http://{server}',
-                    'https': f'http://{server}'
-                }
-
-        # TCP测试
-        try:
-            start = time.perf_counter()
-            with socket.create_connection((ip, port), timeout=timeout, source_address=('0.0.0.0', 0)): # Bind to all interfaces
-                result['tcp'] = (time.perf_counter() - start) * 1000
-        except:
-            pass
-
-        # HTTP测试
-        if result['tcp']:
-            try:
-                start = time.perf_counter()
-                requests.get(f'http://{ip}', headers={'Host': 'speed.cloudflare.com'},
-                            timeout=timeout, proxies=proxies)
-                result['http'] = (time.perf_counter() - start) * 1000
-            except:
-                pass
-
-        # HTTPS测试
-        if result['http']:
-            try:
-                start = time.perf_counter()
-                requests.get(f'https://{ip}', headers={'Host': 'speed.cloudflare.com'},
-                            timeout=timeout, verify=False, proxies=proxies)
-                result['https'] = (time.perf_counter() - start) * 1000
-            except:
-                pass
-
-        return result
+                return {'http': f'http://{server}', 'https': f'http://{server}'}
+        return None
 
     def analyze_results(self, results):
         """结果分析及评分"""
-        valid_results = [r for r in results if r['https']]
+        valid_results = [r for r in results if r['https_avg']]
         if not valid_results:
             return []
 
-        # 计算综合得分
-        min_latency = min(r['https'] for r in valid_results)
+        min_latency = min(r['https_avg'] for r in valid_results)
         for r in valid_results:
-            score = (min_latency / r['https']) * 0.6
-            score += 0.4 * (1 - min(r['https'], 1000)/1000) # Cap latency at 1000ms for score calculation
+            score = (min_latency / r['https_avg']) * 0.6
+            score += 0.4 * (1 - min(r['https_avg'], 1000)/1000)
             r['score'] = round(score, 2)
 
         return sorted(valid_results, key=lambda x: x['score'], reverse=True)
 
-
 class Exporter:
+    """导出器"""
     @staticmethod
     def export_hosts(results, path):
+        """导出 Hosts 文件"""
         config = ConfigManager.load_config()
         domains = config['cloudflare_domains']
         try:
             with open(path, 'w', encoding='utf-8') as f:
                 f.write("# CloudFlare Optimized IPs\n")
                 for result in results:
-                    for domain in domains: # 使用配置中的域名列表
+                    for domain in domains:
                         f.write(f"{result['ip']}    {domain}\n")
             return True
         except Exception as e:
@@ -326,6 +373,7 @@ class Exporter:
 
     @staticmethod
     def export_json(results, path):
+        """导出 JSON 文件"""
         try:
             with open(path, 'w', encoding='utf-8') as f:
                 json.dump({
@@ -339,6 +387,7 @@ class Exporter:
 
     @staticmethod
     def export_csv(results, path):
+        """导出 CSV 文件"""
         try:
             with open(path, 'w', newline='', encoding='utf-8') as f:
                 if results:
@@ -350,9 +399,8 @@ class Exporter:
             print(f"Export CSV failed: {e}")
             return False
 
-
-
 class HistoryWindow(tk.Toplevel):
+    """历史记录窗口"""
     def __init__(self, parent):
         super().__init__(parent)
         self.title("测试历史记录")
@@ -369,12 +417,13 @@ class HistoryWindow(tk.Toplevel):
         self.load_data()
 
     def load_data(self):
+        """加载数据"""
         history_manager = HistoryManager()
         history = history_manager.history
-        for record in reversed(history): # Show latest history first
+        for record in reversed(history):
             data = record['data']
-            if data: # Ensure data is not empty
-                avg_latency = sum(r['https'] for r in data) / len(data) if data else 0
+            if data:
+                avg_latency = sum(r['https_avg'] for r in data) / len(data) if data else 0
                 best_ip = data[0]['ip'] if data else "N/A"
                 self.tree.insert('', 'end', values=(
                     time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(record['timestamp'])),
@@ -388,8 +437,8 @@ class HistoryWindow(tk.Toplevel):
                     "N/A"
                 ))
 
-
 class DiagnosticsWindow(tk.Toplevel):
+    """网络诊断工具窗口"""
     def __init__(self, parent):
         super().__init__(parent)
         self.title("网络诊断工具")
@@ -408,44 +457,47 @@ class DiagnosticsWindow(tk.Toplevel):
         self.grid_columnconfigure(1, weight=1)
         self.grid_rowconfigure(2, weight=1)
 
-
     def run_traceroute(self):
+        """运行路由追踪"""
         host = self.target.get()
         self.output.delete(1.0, tk.END)
         self.output.insert(tk.END, "正在进行路由追踪...\n")
         threading.Thread(target=self._do_traceroute, args=(host,)).start()
 
     def _do_traceroute(self, host):
+        """执行路由追踪"""
         result = NetworkDiagnostics.traceroute(host)
         self.output.delete(1.0, tk.END)
         self.output.insert(tk.END, result)
 
     def run_dns_lookup(self):
+        """运行 DNS 解析"""
         host = self.target.get()
         self.output.delete(1.0, tk.END)
         self.output.insert(tk.END, "正在进行DNS解析...\n")
         threading.Thread(target=self._do_dns_lookup, args=(host,)).start()
 
     def _do_dns_lookup(self, host):
+        """执行 DNS 解析"""
         result = NetworkDiagnostics.dns_lookup(host)
         self.output.delete(1.0, tk.END)
         self.output.insert(tk.END, str(result))
 
-
 class ConfigWindow(tk.Toplevel):
+    """配置窗口"""
     def __init__(self, parent, app):
         super().__init__(parent)
         self.title("配置")
-        self.geometry("450x400") # 稍微增加高度以容纳域名配置
+        self.geometry("450x450")
         self.app = app
         self.config_manager = ConfigManager()
         self.current_config = self.config_manager.load_config()
 
         ttk.Label(self, text="IP类型:").grid(row=0, column=0, padx=5, pady=5, sticky='w')
-        self.ip_type = ttk.Combobox(self, values=['IPv4'], width=8) # 只保留 IPv4 选项
+        self.ip_type = ttk.Combobox(self, values=['IPv4'], width=8)
         self.ip_type.set(self.current_config['ip_type'])
         self.ip_type.grid(row=0, column=1, padx=5, pady=5, sticky='ew')
-        self.ip_type.config(state='readonly') # 设置为只读，防止用户修改为其他值
+        self.ip_type.config(state='readonly')
 
         ttk.Label(self, text="测试数量:").grid(row=1, column=0, padx=5, pady=5, sticky='w')
         self.test_count = ttk.Spinbox(self, from_=100, to=5000, width=7)
@@ -462,68 +514,71 @@ class ConfigWindow(tk.Toplevel):
         self.timeout.set(self.current_config['timeout'])
         self.timeout.grid(row=3, column=1, padx=5, pady=5, sticky='ew')
 
-        # 移除 auto_update checkbox
-        # self.auto_update_var = tk.BooleanVar(value=self.current_config['auto_update'])
-        # ttk.Checkbutton(self, text="自动更新", variable=self.auto_update_var).grid(row=4, column=0, columnspan=2, padx=5, pady=5, sticky='w')
+        ttk.Label(self, text="测试重试次数:").grid(row=4, column=0, padx=5, pady=5, sticky='w')
+        self.test_retries = ttk.Spinbox(self, from_=1, to=10, width=3)
+        self.test_retries.set(self.current_config['test_retries'])
+        self.test_retries.grid(row=4, column=1, padx=5, pady=5, sticky='ew')
 
-        ttk.Label(self, text="Cloudflare 域名列表 (每行一个):").grid(row=4, column=0, padx=5, pady=5, sticky='nw') # 'nw' 靠左上角
-        self.domains_text = tk.Text(self, height=5, width=30) # 多行文本框
-        self.domains_text.grid(row=4, column=1, padx=5, pady=5, sticky='ew')
-        self.domains_text.insert(tk.END, "\n".join(self.current_config['cloudflare_domains'])) # 填充默认域名
+        self.ip_persistent_var = tk.BooleanVar(value=self.current_config['ip_persistent'])
+        ttk.Checkbutton(self, text="启用IP持久化", variable=self.ip_persistent_var).grid(row=5, column=0, columnspan=2, padx=5, pady=5, sticky='w')
 
-        ttk.Button(self, text="保存配置", command=self.save_config).grid(row=5, column=0, columnspan=2, padx=5, pady=10)
+        ttk.Label(self, text="Cloudflare 域名列表 (每行一个):").grid(row=6, column=0, padx=5, pady=5, sticky='nw')
+        self.domains_text = tk.Text(self, height=5, width=30)
+        self.domains_text.grid(row=6, column=1, padx=5, pady=5, sticky='ew')
+        self.domains_text.insert(tk.END, "\n".join(self.current_config['cloudflare_domains']))
 
-        self.grid_columnconfigure(1, weight=1) # 让第二列可以扩展
+        ttk.Button(self, text="保存配置", command=self.save_config).grid(row=7, column=0, columnspan=2, padx=5, pady=10)
+
+        self.grid_columnconfigure(1, weight=1)
 
     def save_config(self):
+        """保存配置"""
         self.current_config['ip_type'] = self.ip_type.get()
         self.current_config['test_count'] = int(self.test_count.get())
         self.current_config['max_threads'] = int(self.max_threads.get())
         self.current_config['timeout'] = int(self.timeout.get())
-        # 移除 auto_update 保存
-        # self.current_config['auto_update'] = self.auto_update_var.get()
-        self.current_config['cloudflare_domains'] = [domain.strip() for domain in self.domains_text.get("1.0", tk.END).strip().splitlines() if domain.strip()] # 获取域名列表
+        self.current_config['test_retries'] = int(self.test_retries.get())
+        self.current_config['ip_persistent'] = self.ip_persistent_var.get()
+        self.current_config['cloudflare_domains'] = [domain.strip() for domain in self.domains_text.get("1.0", tk.END).strip().splitlines() if domain.strip()]
 
         ConfigManager.save_config(self.current_config)
-        self.app.scanner.config = self.current_config # 更新 scanner 中的配置
+        self.app.scanner.config = self.current_config
         self.destroy()
         messagebox.showinfo("配置已保存", "配置已成功保存。")
 
-
 class Application(tk.Tk):
+    """主应用程序类"""
     def __init__(self):
         super().__init__()
         self.scanner = CloudFlareIPScanner()
         self.history_manager = HistoryManager()
-        self.app_config = self.scanner.config # 使用 scanner 的配置
+        self.app_config = self.scanner.config
         self.running = False
         self.results = []
-        self.version = "1.0.2" # 更新版本号
+        self.version = "1.0.2"
         self.init_ui()
         self.load_history()
-        # 移除 auto_update check on startup
-        # self.check_auto_update()
 
     def init_ui(self):
+        """初始化用户界面"""
         self.title(f"CloudFlare IP优选工具 v{self.version}")
         self.geometry("800x600")
 
         self.add_menu()
 
-        # 控制面板
         control_frame = ttk.Frame(self)
         control_frame.pack(pady=10, fill=tk.X)
 
         ttk.Label(control_frame, text="IP类型:").grid(row=0, column=0, padx=5, pady=5)
-        self.ip_type = ttk.Combobox(control_frame, values=['IPv4'], width=8) # 设置宽度，只保留 IPv4 选项
-        self.ip_type.set(self.app_config['ip_type']) # 使用 app_config
+        self.ip_type = ttk.Combobox(control_frame, values=['IPv4'], width=8)
+        self.ip_type.set(self.app_config['ip_type'])
         self.ip_type.grid(row=0, column=1, padx=5, pady=5)
-        self.ip_type.config(state='readonly') # 设置为只读
+        self.ip_type.config(state='readonly')
 
         ttk.Label(control_frame, text="测试数量:").grid(row=0, column=2, padx=5, pady=5)
         self.test_count = ttk.Spinbox(control_frame, from_=100, to=5000, width=7)
         self.test_count.delete(0, 'end')
-        self.test_count.insert(0, str(self.app_config['test_count'])) # 使用 app_config
+        self.test_count.insert(0, str(self.app_config['test_count']))
         self.test_count.grid(row=0, column=3, padx=5, pady=5)
 
         self.start_btn = ttk.Button(control_frame, text="开始测试", command=self.start_scan)
@@ -532,25 +587,22 @@ class Application(tk.Tk):
         self.stop_btn = ttk.Button(control_frame, text="停止测试", command=self.stop_scan, state=tk.DISABLED)
         self.stop_btn.grid(row=0, column=5, padx=10, pady=5)
 
-        self.apply_hosts_btn = ttk.Button(control_frame, text="应用到Hosts", command=self.apply_hosts) # 新增按钮
+        self.apply_hosts_btn = ttk.Button(control_frame, text="应用到Hosts", command=self.apply_hosts)
         self.apply_hosts_btn.grid(row=0, column=6, padx=10, pady=5)
 
-        # 结果表格
         columns = ('ip', 'tcp', 'http', 'https', 'score')
-        self.tree = ttk.Treeview(self, columns=columns, show='headings', selectmode='extended') # 允许 extended 选择
+        self.tree = ttk.Treeview(self, columns=columns, show='headings', selectmode='extended')
 
         self.tree.heading('ip', text='IP地址')
         self.tree.heading('tcp', text='TCP延迟(ms)')
         self.tree.heading('http', text='HTTP延迟(ms)')
         self.tree.heading('https', text='HTTPS延迟(ms)')
         self.tree.heading('score', text='综合评分',
-                           command=lambda: messagebox.showinfo("评分标准", "综合评分 = (最低延迟 / 当前IP延迟) * 0.6 + (1 - min(当前IP延迟, 1000ms) / 1000ms) * 0.4\n\n评分越高，IP 质量越好。\n主要考虑 HTTPS 延迟，并对延迟较低的 IP 给予更高权重。")) # 添加评分标准 Tooltip
-        self.tree.column('score', anchor='center') # 分数列居中显示
-
+                           command=lambda: messagebox.showinfo("评分标准", "综合评分 = (最低延迟 / 当前IP延迟) * 0.6 + (1 - min(当前IP延迟, 1000ms) / 1000ms) * 0.4\n\n评分越高，IP 质量越好。\n主要考虑 HTTPS 延迟，并对延迟较低的 IP 给予更高权重。"))
+        self.tree.column('score', anchor='center')
 
         self.tree.pack(fill=tk.BOTH, expand=True, padx=10, pady=5)
 
-        # 状态栏和进度条
         self.status_frame = ttk.Frame(self)
         self.status_frame.pack(fill=tk.X, side=tk.BOTTOM)
 
@@ -561,8 +613,6 @@ class Application(tk.Tk):
         self.status = ttk.Label(self.status_frame, text="就绪", relief=tk.SUNKEN, anchor='w')
         self.status.pack(fill=tk.X)
 
-
-        # 右键菜单
         self.menu = tk.Menu(self, tearoff=0)
         self.menu.add_command(label="导出到Hosts", command=self.export_hosts)
         self.menu.add_command(label="导出为JSON", command=self.export_json)
@@ -570,62 +620,54 @@ class Application(tk.Tk):
         self.tree.bind("<Button-3>", self.show_menu)
 
     def add_menu(self):
+        """添加菜单栏"""
         menubar = tk.Menu(self)
 
-        # 文件菜单
         file_menu = tk.Menu(menubar, tearoff=0)
         file_menu.add_command(label="配置", command=self.open_config)
         file_menu.add_separator()
         file_menu.add_command(label="退出", command=self.quit)
         menubar.add_cascade(label="文件", menu=file_menu)
 
-        # 工具菜单
         tool_menu = tk.Menu(menubar, tearoff=0)
         tool_menu.add_command(label="网络诊断", command=self.open_diagnostics)
         tool_menu.add_command(label="历史记录", command=self.open_history)
         menubar.add_cascade(label="工具", menu=tool_menu)
 
-        # 代理菜单
         proxy_menu = tk.Menu(menubar, tearoff=0)
         proxy_menu.add_command(label="配置系统代理", command=self.configure_system_proxy)
         menubar.add_cascade(label="代理", menu=proxy_menu)
 
-
-        self.config(menu=menubar) # 使用 Tkinter 的 config 方法设置菜单
+        self.config(menu=menubar)
 
     def configure_system_proxy(self):
-        proxy_settings = self.app_config['proxy_settings'] # 使用 app_config
-        enable = not proxy_settings['enable'] # 切换代理状态
+        """配置系统代理"""
+        proxy_settings = self.app_config['proxy_settings']
+        enable = not proxy_settings['enable']
         server = f"127.0.0.1:{proxy_settings.get('port', 1080)}"
-        bypass = '' # 可以配置绕过地址
+        bypass = ''
 
         if SystemProxy.configure_proxy(enable=enable, server=server, bypass=bypass):
-            self.app_config['proxy_settings']['enable'] = enable # 使用 app_config
-            ConfigManager.save_config(self.app_config) # 保存更新后的代理配置，使用 app_config
+            self.app_config['proxy_settings']['enable'] = enable
+            ConfigManager.save_config(self.app_config)
             messagebox.showinfo("系统代理", f"系统代理已{'启用' if enable else '禁用'}")
         else:
             messagebox.showerror("系统代理", "配置系统代理失败，仅支持Windows系统。")
 
-
-    # 移除 auto_update related methods
-    # def check_auto_update(self):
-    #     if self.app_config.get('auto_update', True): # 使用 app_config
-    #         threading.Thread(target=self._async_check_update).start()
-
-    # def _async_check_update(self):
-    #     if AutoUpdater.check_update(self.version):
-    #         self.status.config(text="发现新版本可用！请关注项目更新") # 更友好的提示信息
-
     def open_config(self):
+        """打开配置窗口"""
         ConfigWindow(self, self)
 
     def open_diagnostics(self):
+        """打开网络诊断窗口"""
         DiagnosticsWindow(self)
 
     def open_history(self):
+        """打开历史记录窗口"""
         HistoryWindow(self)
 
     def start_scan(self):
+        """开始扫描"""
         if self.running:
             return
 
@@ -633,34 +675,35 @@ class Application(tk.Tk):
         self.start_btn.config(state=tk.DISABLED)
         self.stop_btn.config(state=tk.NORMAL)
         self.status.config(text="扫描中...")
-        self.progress_bar.start(10) # 启动不确定进度条
+        self.progress_bar.start(10)
 
-        self.tree.delete(*self.tree.get_children()) # 清空之前的扫描结果
-        self.results = [] # 清空 results 列表
+        self.tree.delete(*self.tree.get_children())
+        self.results = []
 
-        ip_type = self.ip_type.get() # IP 类型始终是 IPv4
+        ip_type = self.ip_type.get()
         count = int(self.test_count.get())
 
         threading.Thread(target=self.run_scan, args=(ip_type, count)).start()
 
     def stop_scan(self):
+        """停止扫描"""
         if self.running:
-            self.running = False # 设置停止扫描的标志
+            self.running = False
             self.status.config(text="停止扫描...")
 
-
     def run_scan(self, ip_type, count):
-        executor = ThreadPoolExecutor(max_workers=self.app_config['max_threads']) # 使用 app_config
+        """执行扫描"""
+        executor = ThreadPoolExecutor(max_workers=self.app_config['max_threads'])
         ips = self.scanner.generate_ips(ip_type, count)
-        futures = [executor.submit(self.scanner.test_latency, ip, timeout=self.app_config['timeout'], proxy_config=self.app_config['proxy_settings']) for ip in ips] # 使用 app_config
+        futures = [executor.submit(self.scanner.test_latency, ip, timeout=self.app_config['timeout'], proxy_config=self.app_config['proxy_settings']) for ip in ips]
 
         completed_count = 0
         total_count = len(ips)
-        temp_results_for_ui = [] # 临时列表，用于存储带评分的结果，用于UI显示
+        temp_results_for_ui = []
 
         for future in futures:
-            if not self.running: # 检查停止扫描的标志
-                executor.shutdown(wait=False) # 立即停止所有 worker
+            if not self.running:
+                executor.shutdown(wait=False)
                 break
 
             result = future.result()
@@ -668,43 +711,43 @@ class Application(tk.Tk):
             completed_count += 1
             self.update_progress(completed_count, total_count)
 
-            if result['https']:
-                temp_results_for_ui.append(result) # 先添加到临时列表
+            if result['https_avg']:
+                temp_results_for_ui.append(result)
 
-        executor.shutdown(wait=True) # 等待所有任务完成或取消
+        executor.shutdown(wait=True)
 
-        analyzed_results = self.scanner.analyze_results(temp_results_for_ui) # 只分析有 https 结果的
+        analyzed_results = self.scanner.analyze_results(temp_results_for_ui)
         if analyzed_results:
-             for result in analyzed_results: # 使用排序后的结果
+             for result in analyzed_results:
                 self.tree.insert('', 'end', values=(
                     result['ip'],
-                    f"{result['tcp']:.1f}" if result['tcp'] is not None else '超时',
-                    f"{result['http']:.1f}" if result['http'] is not None else '超时',
-                    f"{result['https']:.1f}" if result['https'] is not None else '超时',
-                    result.get('score', '') # 确保显示评分
+                    f"{result['tcp_avg']:.1f}" if result['tcp_avg'] is not None else '超时',
+                    f"{result['http_avg']:.1f}" if result['http_avg'] is not None else '超时',
+                    f"{result['https_avg']:.1f}" if result['https_avg'] is not None else '超时',
+                    result.get('score', '')
                 ))
-             self.history_manager.add_record(analyzed_results[:10]) # 存储最佳结果到历史记录
+             self.history_manager.add_record(analyzed_results[:10])
         else:
             messagebox.showinfo("扫描结果", "没有找到可用的 Cloudflare IP。")
-
 
         self.running = False
         self.start_btn.config(state=tk.NORMAL)
         self.stop_btn.config(state=tk.DISABLED)
-        self.progress_bar.stop() # 停止进度条
-        self.progress_var.set(0) # 重置进度条
+        self.progress_bar.stop()
+        self.progress_var.set(0)
         self.status.config(text="扫描完成")
         if analyzed_results:
             messagebox.showinfo("扫描结果", f"扫描完成，找到 {len(analyzed_results)} 个可用 IP。最佳IP: {analyzed_results[0]['ip'] if analyzed_results else 'N/A'}")
 
-
     def update_progress(self, completed, total):
+        """更新进度条"""
         percent = (completed / total) * 100
         self.progress_var.set(percent)
         self.status.config(text=f"扫描中... ({completed}/{total} - {percent:.1f}%)")
-        self.update_idletasks() # 强制 UI 更新
+        self.update_idletasks()
 
     def apply_hosts(self):
+        """应用到 Hosts 文件"""
         selected_items = self.tree.selection()
         if not selected_items:
             messagebox.showinfo("应用到Hosts", "请在结果表格中选择要应用的IP地址。")
@@ -713,8 +756,7 @@ class Application(tk.Tk):
         selected_ips_results = []
         for item_id in selected_items:
             item_values = self.tree.item(item_id, 'values')
-            ip_address = item_values[0] # IP地址在第一列
-            # 找到原始结果中匹配IP的结果项
+            ip_address = item_values[0]
             for result in self.results:
                 if result['ip'] == ip_address:
                     selected_ips_results.append(result)
@@ -727,7 +769,7 @@ class Application(tk.Tk):
         os_type = platform.system()
         if os_type == 'Windows':
             hosts_path = r"C:\Windows\System32\drivers\etc\hosts"
-        elif os_type == 'Linux' or os_type == 'Darwin': # Darwin is macOS
+        elif os_type == 'Linux' or os_type == 'Darwin':
             hosts_path = "/etc/hosts"
         else:
             messagebox.showerror("应用到Hosts", f"不支持的操作系统: {os_type}，无法确定Hosts文件路径。")
@@ -738,18 +780,19 @@ class Application(tk.Tk):
         else:
             messagebox.showerror("应用到Hosts", f"应用 Hosts 文件失败: {hosts_path}，请检查权限或文件是否存在。")
 
-
     def load_history(self):
-        # 占位符，如果需要在启动时加载历史记录到 UI，可以在这里实现
+        """加载历史记录"""
         pass
 
     def show_menu(self, event):
+        """显示右键菜单"""
         item = self.tree.identify_row(event.y)
         if item:
             self.tree.selection_set(item)
             self.menu.post(event.x_root, event.y_root)
 
     def export_hosts(self):
+        """导出 Hosts 文件"""
         if not self.results:
             messagebox.showinfo("导出", "没有扫描结果可以导出。")
             return
@@ -765,6 +808,7 @@ class Application(tk.Tk):
                  messagebox.showinfo("导出", "没有有效的扫描结果可以导出。")
 
     def export_json(self):
+        """导出 JSON 文件"""
         if not self.results:
             messagebox.showinfo("导出", "没有扫描结果可以导出。")
             return
@@ -780,6 +824,7 @@ class Application(tk.Tk):
                  messagebox.showinfo("导出", "没有有效的扫描结果可以导出。")
 
     def export_csv(self):
+        """导出 CSV 文件"""
         if not self.results:
             messagebox.showinfo("导出", "没有扫描结果可以导出。")
             return
@@ -793,7 +838,6 @@ class Application(tk.Tk):
                     messagebox.showerror("导出", "导出 CSV 文件失败。")
              else:
                  messagebox.showinfo("导出", "没有有效的扫描结果可以导出。")
-
 
 if __name__ == "__main__":
     app = Application()
